@@ -1,22 +1,49 @@
+import discord
+from discord.ext import commands
 import sqlite3
 import time
 import random
 import os
+import re
 import json
+import threading
+import uvicorn
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, List
 
-app = FastAPI(title="HORT TRANS FULL API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+# ==========================================
+# ⚙️ НАЛАШТУВАННЯ (ВСТАВ СВОЄ)
+# ==========================================
+TOKEN = "MTQ3Mzk4NDMzNTc3NzYyODM5NA.GTyOO7._iQlGiBrs_OE5PyK2hSoK5liBE5tgkz4h0SBEc"
+GUILD_ID = 1405544328956477522
+TRUCKBOOK_CHANNEL_ID = 1556226431854583852
+CHANNEL_EARNINGS_LOG = 1556226134322978836
 
 DB_FILE = "economy.db"
 
+# ==========================================
+# БАЗА ДАНИХ
+# ==========================================
 def db_connect():
     conn = sqlite3.connect(DB_FILE, timeout=15.0, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
+
+def init_db():
+    conn = db_connect(); c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY, nickname TEXT, truckbook_nick TEXT,
+        distance INTEGER DEFAULT 0, coins INTEGER DEFAULT 0, weekly_earnings INTEGER DEFAULT 0)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS trip_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, distance INTEGER, 
+        reward INTEGER, tariff TEXT, timestamp INTEGER)""")
+    conn.commit(); conn.close()
+
+def get_avatar_url(uid):
+    avatar_id = (uid >> 22) % 6 if uid else 0
+    return f"https://cdn.discordapp.com/embed/avatars/{avatar_id}.png"
 
 def update_coins(uid, amount):
     conn = db_connect(); c = conn.cursor()
@@ -24,37 +51,23 @@ def update_coins(uid, amount):
     c.execute("UPDATE users SET coins = coins + ? WHERE user_id = ?", (amount, uid))
     conn.commit(); conn.close()
 
-def get_avatar_url(uid):
-    avatar_id = (uid >> 22) % 6 if uid else 0
-    return f"https://cdn.discordapp.com/embed/avatars/{avatar_id}.png"
+# ==========================================
+# FASTAPI (САЙТ ТА API)
+# ==========================================
+app = FastAPI(title="HORT TRANS FULL API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ==========================================
-# МОДЕЛІ
-# ==========================================
-class LoginReq(BaseModel):
-    nick: str
-class TransferReq(BaseModel):
-    sender_id: int
-    receiver_id: int
-    amount: int
-class GameReq(BaseModel):
-    user_id: int
-    bet: int = 0
-    action: Optional[str] = None
-    game_data: Optional[dict] = None
-class CreateRoomReq(BaseModel):
-    host_uid: int
-    bet: int
+class LoginReq(BaseModel): nick: str
+class TransferReq(BaseModel): sender_id: int; receiver_id: int; amount: int
+class GameReq(BaseModel): user_id: int; bet: int = 0; action: Optional[str] = None; game_data: Optional[dict] = None
+class CreateRoomReq(BaseModel): host_uid: int; bet: int
 
-# ==========================================
-# API ДЛЯ ПРОФІЛЮ
-# ==========================================
 @app.post("/api/login")
 def login(req: LoginReq):
     conn = db_connect(); c = conn.cursor()
     c.execute("SELECT user_id, truckbook_nick FROM users WHERE LOWER(truckbook_nick) = LOWER(?)", (req.nick.strip(),))
     row = c.fetchone(); conn.close()
-    if not row: raise HTTPException(404, "Нік не знайдено")
+    if not row: raise HTTPException(404, "Нік не знайдено в базі")
     return {"user_id": row[0], "nick": row[1]}
 
 @app.get("/api/profile/{uid}")
@@ -65,12 +78,12 @@ def profile(uid: int):
     row = c.fetchone(); conn.close()
     return {"user_id": uid, "distance": row[0] or 0, "coins": row[1] or 0, "weekly": row[2] or 0, "nickname": row[3] or "—", "discord_name": row[4] or f"Driver {uid}", "avatar": get_avatar_url(uid)}
 
-@app.get("/api/drivers")
-def drivers_list():
+@app.get("/api/trips/{uid}")
+def user_trips(uid: int):
     conn = db_connect(); c = conn.cursor()
-    c.execute("SELECT user_id, COALESCE(truckbook_nick, nickname, 'Driver'), coins, distance FROM users WHERE coins > 0 OR distance > 0 OR truckbook_nick IS NOT NULL ORDER BY coins DESC")
+    c.execute("SELECT distance, reward, tariff, timestamp FROM trip_history WHERE user_id = ? ORDER BY timestamp DESC LIMIT 10", (uid,))
     rows = c.fetchall(); conn.close()
-    return [{"id": r[0], "name": r[1], "coins": r[2] or 0, "distance": r[3] or 0, "avatar": get_avatar_url(r[0])} for r in rows]
+    return [{"distance": r[0], "reward": r[1], "tariff": r[2], "time": r[3]} for r in rows]
 
 @app.post("/api/transfer")
 def transfer(req: TransferReq):
@@ -85,9 +98,7 @@ def transfer(req: TransferReq):
     conn.commit(); conn.close()
     return {"message": f"✅ Передано {req.amount} HC"}
 
-# ==========================================
-# ВСІ ІГРИ (ДЛЯ БОТА)
-# ==========================================
+# --- ІГРИ ---
 @app.post("/api/game/casino")
 def casino(req: GameReq):
     slots = ["🍒", "🍋", "🍇", "💎", "7️⃣"]
@@ -127,13 +138,6 @@ def thimbles(req: GameReq):
     update_coins(req.user_id, win - req.bet)
     return {"win_cup": win_cup, "chosen": int(req.action), "win": win, "bet": req.bet}
 
-@app.post("/api/game/wheel")
-def wheel(req: GameReq):
-    m = random.choice([0, 0.2, 0.5, 1, 1.5, 2, 3])
-    win = int(req.bet * m)
-    update_coins(req.user_id, win - req.bet)
-    return {"multiplier": m, "win": win, "bet": req.bet}
-
 @app.post("/api/game/roulette")
 def roulette(req: GameReq):
     reds = [1, 3, 5, 7, 9, 11, 13]; blacks = [2, 4, 6, 8, 10, 12]
@@ -141,28 +145,6 @@ def roulette(req: GameReq):
     win = req.bet * 14 if (req.action == "number" and req.game_data.get('num') == res) else (req.bet * 2 if ((req.action == "red" and res in reds) or (req.action == "black" and res in blacks)) else 0)
     update_coins(req.user_id, win - req.bet)
     return {"number": res, "color": "red" if res in reds else ("black" if res in blacks else "green"), "win": win, "bet": req.bet}
-
-@app.post("/api/game/double")
-def double(req: GameReq):
-    side = random.choice(["heads", "tails"])
-    win = req.bet if req.action == side else 0
-    update_coins(req.user_id, win - req.bet)
-    return {"side": side, "win": win, "bet": req.bet}
-
-@app.post("/api/game/russian")
-def russian(req: GameReq):
-    bullet = random.randint(1, 6) == 1
-    win = 0 if bullet else int(req.bet * 1.2)
-    update_coins(req.user_id, win - req.bet)
-    return {"bullet": bullet, "win": win, "bet": req.bet}
-
-@app.post("/api/game/smuggler")
-def smuggler(req: GameReq):
-    is_safe = req.action == "safe"
-    success = random.random() < (0.8 if is_safe else 0.5)
-    win = int(req.bet * (1.5 if is_safe else 3)) if success else 0
-    update_coins(req.user_id, win - req.bet)
-    return {"success": success, "win": win, "bet": req.bet}
 
 @app.post("/api/game/blackjack")
 def blackjack(req: GameReq):
@@ -193,10 +175,8 @@ def blackjack(req: GameReq):
         return {"status":"finished", "p_hand":req.game_data['p_hand'], "d_hand":d_hand, "p_score":ps, "d_score":ds, "result":res, "win": win_amt, "bet": req.bet}
 
 # ==========================================
-# WEBSOCKETS (МУЛЬТИПЛЕЄР)
+# МУЛЬТИПЛЕЄР (ДУРЕНЬ)
 # ==========================================
-SUITS = ['♠', '♥', '♦', '♣']; RANKS_36 = ['6','7','8','9','10','J','Q','K','A']
-
 class Player:
     def __init__(self, uid, nick, avatar, websocket):
         self.uid = uid; self.nick = nick; self.avatar = avatar
@@ -212,7 +192,7 @@ class Room:
         return [{"id": p.uid, "nick": p.nick, "avatar": p.avatar, "ready": p.is_ready, "cards_count": len(p.hand)} for p in self.players.values()]
 
     def start_game(self):
-        self.deck = [{"rank": r, "suit": s} for s in SUITS for r in RANKS_36]
+        self.deck = [{"rank": r, "suit": s} for s in ['♠', '♥', '♦', '♣'] for r in ['6','7','8','9','10','J','Q','K','A']]
         random.shuffle(self.deck); self.trump = self.deck[-1]['suit']
         for p in self.players.values():
             p.hand = [self.deck.pop() for _ in range(6)]; p.is_ready = False
@@ -235,7 +215,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str, uid: int, nick:
     player = Player(uid, nick, get_avatar_url(uid), websocket)
     room.players[uid] = player
     await broadcast(room, {"type": "room_update", "players": room.get_player_list(), "host": room.host_uid})
-
     try:
         while True:
             data = await websocket.receive_text(); msg = json.loads(data)
@@ -258,7 +237,63 @@ async def broadcast(room: Room, message: dict):
         try: await p.ws.send_json(message)
         except: pass
 
+# ==========================================
+# DISCORD БОТ (ЖИВЕ РАЗОМ З САЙТОМ)
+# ==========================================
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+@bot.event
+async def on_ready():
+    print(f"✅ Бот {bot.user} запущений! База даних спільна.")
+
+@bot.event
+async def on_message(message):
+    if message.author == bot.user: return
+    if message.channel.id == TRUCKBOOK_CHANNEL_ID and message.embeds:
+        for embed in message.embeds:
+            # Парсинг TruckBook
+            nickname = embed.author.name.strip() if embed.author and embed.author.name else ""
+            full_text = (embed.description or "") + "\n" + "\n".join([f.value for f in embed.fields if f.value])
+            
+            dist_match = re.search(r"Прийнята відстань:\s*([\d\s,\.]+)\s*km", full_text, re.IGNORECASE)
+            stat_match = re.search(r"Статистика:\s*(.+)", full_text, re.IGNORECASE)
+            
+            if nickname and dist_match and stat_match:
+                distance = int(re.sub(r"[\s,\.]", "", dist_match.group(1)))
+                tariff = stat_match.group(1).strip()
+                rate = 15 if "wot" in tariff.lower() else (10 if "реал" in tariff.lower() else 5)
+                coins = max(1, int((distance / 1000) * rate))
+                
+                # Шукаємо юзера
+                conn = db_connect(); c = conn.cursor()
+                c.execute("SELECT user_id FROM users WHERE LOWER(truckbook_nick) = LOWER(?)", (nickname,))
+                user_row = c.fetchone()
+                
+                if user_row:
+                    uid = user_row[0]
+                    c.execute("UPDATE users SET distance = distance + ?, coins = coins + ?, weekly_earnings = weekly_earnings + ? WHERE user_id = ?", (distance, coins, coins, uid))
+                    c.execute("INSERT INTO trip_history (user_id, distance, reward, tariff, timestamp) VALUES (?, ?, ?, ?, ?)", (uid, distance, coins, tariff, int(time.time())))
+                    conn.commit()
+                    
+                    log_channel = bot.get_channel(CHANNEL_EARNINGS_LOG)
+                    if log_channel:
+                        log_embed = discord.Embed(title="📦 РЕЙС ЗАРАХОВАНО", color=0x4CAF50)
+                        log_embed.description = f"Водій **{nickname}** здав рейс!\n🛣️ {distance:,} км\n💰 +{coins} HC"
+                        await log_channel.send(embed=log_embed)
+                conn.close()
+    await bot.process_commands(message)
+
+def run_bot():
+    bot.run(TOKEN)
+
 if __name__ == "__main__":
-    import uvicorn
+    init_db()
+    # Запускаємо бота в окремому потоці, щоб він не блокував сайт
+    threading.Thread(target=run_bot, daemon=True).start()
+    
+    # Запускаємо сайт
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
