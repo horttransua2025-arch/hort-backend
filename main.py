@@ -50,7 +50,15 @@ def init_db():
 # FASTAPI (САЙТ ТА API)
 # ==========================================
 app = FastAPI(title="HortCoin API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# ДОЗВОЛЯЄМО ЗАПИТИ З БУДЬ-ЯКОГО ДОМЕНУ (включаючи GitHub Pages)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False, # Важливо для безпеки та сумісності
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class LoginReq(BaseModel):
     nick: str
