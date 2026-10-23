@@ -14,9 +14,12 @@ from pydantic import BaseModel
 from typing import Optional, Dict, List
 
 # ==========================================
-# ⚙️ НАЛАШТУВАННЯ (ВСТАВ СВОЄ)
+# ⚙️ НАЛАШТУВАННЯ
 # ==========================================
-TOKEN = "MTQ3Mzk4NDMzNTc3NzYyODM5NA.GTyOO7._iQlGiBrs_OE5PyK2hSoK5liBE5tgkz4h0SBEc"
+# Токен береться зі змінних середовища Render (Environment Variables)
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+# ID каналів (залишаємо як константи)
 GUILD_ID = 1405544328956477522
 TRUCKBOOK_CHANNEL_ID = 1556226431854583852
 CHANNEL_EARNINGS_LOG = 1556226134322978836
@@ -238,7 +241,7 @@ async def broadcast(room: Room, message: dict):
         except: pass
 
 # ==========================================
-# DISCORD БОТ (ЖИВЕ РАЗОМ З САЙТОМ)
+# DISCORD БОТ
 # ==========================================
 intents = discord.Intents.default()
 intents.message_content = True
@@ -247,14 +250,13 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"✅ Бот {bot.user} запущений! База даних спільна.")
+    print(f"✅ Бот {bot.user} запущений! База даних спільна з сайтом.")
 
 @bot.event
 async def on_message(message):
     if message.author == bot.user: return
     if message.channel.id == TRUCKBOOK_CHANNEL_ID and message.embeds:
         for embed in message.embeds:
-            # Парсинг TruckBook
             nickname = embed.author.name.strip() if embed.author and embed.author.name else ""
             full_text = (embed.description or "") + "\n" + "\n".join([f.value for f in embed.fields if f.value])
             
@@ -267,7 +269,6 @@ async def on_message(message):
                 rate = 15 if "wot" in tariff.lower() else (10 if "реал" in tariff.lower() else 5)
                 coins = max(1, int((distance / 1000) * rate))
                 
-                # Шукаємо юзера
                 conn = db_connect(); c = conn.cursor()
                 c.execute("SELECT user_id FROM users WHERE LOWER(truckbook_nick) = LOWER(?)", (nickname,))
                 user_row = c.fetchone()
@@ -287,13 +288,21 @@ async def on_message(message):
     await bot.process_commands(message)
 
 def run_bot():
-    bot.run(TOKEN)
+    if TOKEN:
+        bot.run(TOKEN)
+    else:
+        print("⚠️ Токен Discord не знайдено! Бот не запущено. Перевірте Environment Variables на Render.")
 
+# ==========================================
+# ЗАПУСК
+# ==========================================
 if __name__ == "__main__":
     init_db()
-    # Запускаємо бота в окремому потоці, щоб він не блокував сайт
+    
+    # Запуск бота в окремому потоці
     threading.Thread(target=run_bot, daemon=True).start()
     
-    # Запускаємо сайт
+    # Запуск веб-сервера
     port = int(os.getenv("PORT", 8000))
+    print(f"🚀 Сайт та API запущено на порту {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
