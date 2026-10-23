@@ -16,14 +16,9 @@ from typing import Optional, Dict, List
 # ==========================================
 # ⚙️ НАЛАШТУВАННЯ
 # ==========================================
-# Токен береться зі змінних середовища Render (Environment Variables)
-TOKEN = os.getenv("DISCORD_TOKEN")
-
-# ID каналів (залишаємо як константи)
-GUILD_ID = 1405544328956477522
+TOKEN = os.getenv("DISCORD_TOKEN") # Береться з Render Environment Variables
 TRUCKBOOK_CHANNEL_ID = 1556226431854583852
 CHANNEL_EARNINGS_LOG = 1556226134322978836
-
 DB_FILE = "economy.db"
 
 # ==========================================
@@ -33,16 +28,6 @@ def db_connect():
     conn = sqlite3.connect(DB_FILE, timeout=15.0, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
-
-def init_db():
-    conn = db_connect(); c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY, nickname TEXT, truckbook_nick TEXT,
-        distance INTEGER DEFAULT 0, coins INTEGER DEFAULT 0, weekly_earnings INTEGER DEFAULT 0)""")
-    c.execute("""CREATE TABLE IF NOT EXISTS trip_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, distance INTEGER, 
-        reward INTEGER, tariff TEXT, timestamp INTEGER)""")
-    conn.commit(); conn.close()
 
 def get_avatar_url(uid):
     avatar_id = (uid >> 22) % 6 if uid else 0
@@ -57,7 +42,7 @@ def update_coins(uid, amount):
 # ==========================================
 # FASTAPI (САЙТ ТА API)
 # ==========================================
-app = FastAPI(title="HORT TRANS FULL API")
+app = FastAPI(title="HORT TRANS API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 class LoginReq(BaseModel): nick: str
@@ -77,9 +62,19 @@ def login(req: LoginReq):
 def profile(uid: int):
     conn = db_connect(); c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO users (user_id, coins) VALUES (?, 0)", (uid,)); conn.commit()
-    c.execute("SELECT distance, coins, weekly_earnings, truckbook_nick, nickname FROM users WHERE user_id = ?", (uid,))
+    # ПОВЕРТАЄМО ВЕСЬ ПРОФІЛЬ
+    c.execute("SELECT distance, days_in_company, coins, weekly_earnings, truckbook_nick, nickname FROM users WHERE user_id = ?", (uid,))
     row = c.fetchone(); conn.close()
-    return {"user_id": uid, "distance": row[0] or 0, "coins": row[1] or 0, "weekly": row[2] or 0, "nickname": row[3] or "—", "discord_name": row[4] or f"Driver {uid}", "avatar": get_avatar_url(uid)}
+    return {
+        "user_id": uid, 
+        "distance": row[0] or 0, 
+        "days": row[1] or 0, 
+        "coins": row[2] or 0, 
+        "weekly": row[3] or 0, 
+        "nickname": row[4] or "—", 
+        "discord_name": row[5] or f"Driver {uid}", 
+        "avatar": get_avatar_url(uid)
+    }
 
 @app.get("/api/trips/{uid}")
 def user_trips(uid: int):
@@ -141,6 +136,13 @@ def thimbles(req: GameReq):
     update_coins(req.user_id, win - req.bet)
     return {"win_cup": win_cup, "chosen": int(req.action), "win": win, "bet": req.bet}
 
+@app.post("/api/game/wheel")
+def wheel(req: GameReq):
+    m = random.choice([0, 0.2, 0.5, 1, 1.5, 2, 3])
+    win = int(req.bet * m)
+    update_coins(req.user_id, win - req.bet)
+    return {"multiplier": m, "win": win, "bet": req.bet}
+
 @app.post("/api/game/roulette")
 def roulette(req: GameReq):
     reds = [1, 3, 5, 7, 9, 11, 13]; blacks = [2, 4, 6, 8, 10, 12]
@@ -148,6 +150,28 @@ def roulette(req: GameReq):
     win = req.bet * 14 if (req.action == "number" and req.game_data.get('num') == res) else (req.bet * 2 if ((req.action == "red" and res in reds) or (req.action == "black" and res in blacks)) else 0)
     update_coins(req.user_id, win - req.bet)
     return {"number": res, "color": "red" if res in reds else ("black" if res in blacks else "green"), "win": win, "bet": req.bet}
+
+@app.post("/api/game/double")
+def double(req: GameReq):
+    side = random.choice(["heads", "tails"])
+    win = req.bet if req.action == side else 0
+    update_coins(req.user_id, win - req.bet)
+    return {"side": side, "win": win, "bet": req.bet}
+
+@app.post("/api/game/russian")
+def russian(req: GameReq):
+    bullet = random.randint(1, 6) == 1
+    win = 0 if bullet else int(req.bet * 1.2)
+    update_coins(req.user_id, win - req.bet)
+    return {"bullet": bullet, "win": win, "bet": req.bet}
+
+@app.post("/api/game/smuggler")
+def smuggler(req: GameReq):
+    is_safe = req.action == "safe"
+    success = random.random() < (0.8 if is_safe else 0.5)
+    win = int(req.bet * (1.5 if is_safe else 3)) if success else 0
+    update_coins(req.user_id, win - req.bet)
+    return {"success": success, "win": win, "bet": req.bet}
 
 @app.post("/api/game/blackjack")
 def blackjack(req: GameReq):
@@ -178,8 +202,11 @@ def blackjack(req: GameReq):
         return {"status":"finished", "p_hand":req.game_data['p_hand'], "d_hand":d_hand, "p_score":ps, "d_score":ds, "result":res, "win": win_amt, "bet": req.bet}
 
 # ==========================================
-# МУЛЬТИПЛЕЄР (ДУРЕНЬ)
+# МУЛЬТИПЛЕЄР (ДУРЕНЬ - ПОВНА ЛОГІКА)
 # ==========================================
+SUITS = ['♠', '♥', '♦', '♣']; RANKS_36 = ['6','7','8','9','10','J','Q','K','A']
+def can_beat(a, d, t): return (d['suit'] == a['suit'] and RANKS_36.index(d['rank']) > RANKS_36.index(a['rank'])) or (d['suit'] == t and a['suit'] != t)
+
 class Player:
     def __init__(self, uid, nick, avatar, websocket):
         self.uid = uid; self.nick = nick; self.avatar = avatar
@@ -190,16 +217,20 @@ class Room:
         self.room_id = room_id; self.bet = bet; self.host_uid = host_uid
         self.players: Dict[int, Player] = {}; self.deck = []
         self.trump = ""; self.table = []; self.status = "waiting"
+        self.turn_uid = None # Хто зараз ходить (атакує)
+        self.defender_uid = None # Хто зараз захищається
 
     def get_player_list(self):
         return [{"id": p.uid, "nick": p.nick, "avatar": p.avatar, "ready": p.is_ready, "cards_count": len(p.hand)} for p in self.players.values()]
 
     def start_game(self):
-        self.deck = [{"rank": r, "suit": s} for s in ['♠', '♥', '♦', '♣'] for r in ['6','7','8','9','10','J','Q','K','A']]
+        self.deck = [{"rank": r, "suit": s} for s in SUITS for r in RANKS_36]
         random.shuffle(self.deck); self.trump = self.deck[-1]['suit']
         for p in self.players.values():
             p.hand = [self.deck.pop() for _ in range(6)]; p.is_ready = False
         self.table = []; self.status = "playing"
+        self.turn_uid = list(self.players.keys())[0]
+        self.defender_uid = list(self.players.keys())[1]
 
 rooms: Dict[str, Room] = {}
 
@@ -209,48 +240,111 @@ def create_room(req: CreateRoomReq):
     rooms[room_id] = Room(room_id, req.bet, req.host_uid)
     return {"room_id": room_id}
 
-@app.websocket("/ws/{room_id}/{uid}/{nick}")
-async def websocket_endpoint(websocket: WebSocket, room_id: str, uid: int, nick: str):
+@app.websocket("/ws/{room_id}/{uid}")
+async def websocket_endpoint(websocket: WebSocket, room_id: str, uid: int):
     await websocket.accept()
-    if room_id not in rooms:
-        await websocket.send_json({"type": "error", "msg": "Кімнату не знайдено"}); await websocket.close(); return
+    if room_id not in rooms: await websocket.close(); return
     room = rooms[room_id]
+    
+    # Отримуємо дані гравця з бази
+    conn = db_connect(); c = conn.cursor()
+    c.execute("SELECT COALESCE(truckbook_nick, nickname, 'Driver') FROM users WHERE user_id=?", (uid,))
+    row = c.fetchone(); conn.close()
+    nick = row[0] if row else f"Driver {uid}"
+    
     player = Player(uid, nick, get_avatar_url(uid), websocket)
     room.players[uid] = player
+    
     await broadcast(room, {"type": "room_update", "players": room.get_player_list(), "host": room.host_uid})
+    
     try:
         while True:
             data = await websocket.receive_text(); msg = json.loads(data)
+            
             if msg['type'] == 'ready':
                 player.is_ready = True
                 if len(room.players) >= 2 and all(p.is_ready for p in room.players.values()):
                     room.start_game()
-                    for uid_loop, p in room.players.items():
-                        await p.ws.send_json({"type": "game_start", "trump": room.trump, "table": room.table, "my_hand": p.hand, "players": room.get_player_list()})
+                    await broadcast_game_state(room)
                 else:
                     await broadcast(room, {"type": "room_update", "players": room.get_player_list(), "host": room.host_uid})
+            
+            elif msg['type'] == 'attack':
+                if uid == room.turn_uid and room.status == "playing":
+                    card_idx = msg['card_idx']
+                    if card_idx < len(player.hand):
+                        card = player.hand.pop(card_idx)
+                        room.table.append({"attack": card, "defend": None})
+                        await broadcast_game_state(room)
+                        
+            elif msg['type'] == 'defend':
+                if uid == room.defender_uid and room.status == "playing" and room.table and room.table[-1]['defend'] is None:
+                    card_idx = msg['card_idx']
+                    if card_idx < len(player.hand):
+                        card = player.hand[card_idx]
+                        if can_beat(room.table[-1]['attack'], card, room.trump):
+                            player.hand.pop(card_idx)
+                            room.table[-1]['defend'] = card
+                            await broadcast_game_state(room)
+                            
+            elif msg['type'] == 'take':
+                if uid == room.defender_uid and room.status == "playing":
+                    # Забирає всі карти зі столу
+                    for pair in room.table:
+                        player.hand.append(pair['attack'])
+                        if pair['defend']: player.hand.append(pair['defend'])
+                    room.table = []
+                    # Добираємо карти з колоди
+                    while len(player.hand) < 6 and room.deck: player.hand.append(room.deck.pop())
+                    # Хід переходить до наступного
+                    room.turn_uid = room.defender_uid
+                    room.defender_uid = room.get_next_player(room.defender_uid)
+                    await broadcast_game_state(room)
+                    
+            elif msg['type'] == 'pass':
+                if uid == room.turn_uid and room.status == "playing":
+                    # Перевіряємо чи всі відбиті
+                    if all(p['defend'] is not None for p in room.table):
+                        room.table = [] # Скидаємо в відбій
+                        # Добираємо карти
+                        for p in room.players.values():
+                            while len(p.hand) < 6 and room.deck: p.hand.append(room.deck.pop())
+                        # Хід переходить до захисника
+                        room.turn_uid = room.defender_uid
+                        room.defender_uid = room.get_next_player(room.defender_uid)
+                        await broadcast_game_state(room)
+
     except WebSocketDisconnect:
-        if uid in room.players:
-            del room.players[uid]
-            await broadcast(room, {"type": "room_update", "players": room.get_player_list(), "host": room.host_uid})
-            if len(room.players) == 0: del rooms[room_id]
+        if uid in room.players: del room.players[uid]
+        if len(room.players) == 0: del rooms[room_id]
+        else: await broadcast(room, {"type": "room_update", "players": room.get_player_list(), "host": room.host_uid})
 
 async def broadcast(room: Room, message: dict):
     for p in room.players.values():
         try: await p.ws.send_json(message)
         except: pass
 
+async def broadcast_game_state(room: Room):
+    for uid, p in room.players.items():
+        await p.ws.send_json({
+            "type": "game_update", 
+            "trump": room.trump, 
+            "table": room.table, 
+            "my_hand": p.hand, 
+            "players": room.get_player_list(),
+            "turn_uid": room.turn_uid,
+            "defender_uid": room.defender_uid
+        })
+
 # ==========================================
 # DISCORD БОТ
 # ==========================================
 intents = discord.Intents.default()
 intents.message_content = True
-intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
-async def on_ready():
-    print(f"✅ Бот {bot.user} запущений! База даних спільна з сайтом.")
+async def on_ready(): print(f"✅ Бот {bot.user} запущений!")
 
 @bot.event
 async def on_message(message):
@@ -259,7 +353,6 @@ async def on_message(message):
         for embed in message.embeds:
             nickname = embed.author.name.strip() if embed.author and embed.author.name else ""
             full_text = (embed.description or "") + "\n" + "\n".join([f.value for f in embed.fields if f.value])
-            
             dist_match = re.search(r"Прийнята відстань:\s*([\d\s,\.]+)\s*km", full_text, re.IGNORECASE)
             stat_match = re.search(r"Статистика:\s*(.+)", full_text, re.IGNORECASE)
             
@@ -288,21 +381,10 @@ async def on_message(message):
     await bot.process_commands(message)
 
 def run_bot():
-    if TOKEN:
-        bot.run(TOKEN)
-    else:
-        print("⚠️ Токен Discord не знайдено! Бот не запущено. Перевірте Environment Variables на Render.")
+    if TOKEN: bot.run(TOKEN)
+    else: print("⚠️ Токен Discord не знайдено!")
 
-# ==========================================
-# ЗАПУСК
-# ==========================================
 if __name__ == "__main__":
-    init_db()
-    
-    # Запуск бота в окремому потоці
     threading.Thread(target=run_bot, daemon=True).start()
-    
-    # Запуск веб-сервера
     port = int(os.getenv("PORT", 8000))
-    print(f"🚀 Сайт та API запущено на порту {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
